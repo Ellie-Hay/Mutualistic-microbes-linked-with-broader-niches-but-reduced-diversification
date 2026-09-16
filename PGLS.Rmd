@@ -1,0 +1,56 @@
+---
+title: "Phylogenetic Generalised Least Squares regressions"
+# output: html_notebook
+---
+
+
+load packages
+```{r}
+library(ape)
+library(nlme)
+```
+
+
+load data
+```{r}
+Poa_data <- read.csv("Poa_data.csv")
+Poa_data
+
+Poa_tree <- read.tree("tree.nex")
+Poa_tree
+```
+
+
+PGLS models
+```{r}
+pgls.mod.1 <- gls(log_range_size ~ endophyte_status, data= Poa_data, correlation=corPagel(1,Poa_tree, form = ~species))
+summary(pgls.mod.1)
+```
+
+```{r}
+pgls.mod.2 <- gls(log_primary_axis_range ~ endophyte_status, data= Poa_data, correlation=corPagel(1,Poa_tree, form = ~species))
+summary(pgls.mod.2)
+```
+
+```{r}
+pgls.mod.3 <- gls(log_hypervolumevolume ~ endophyte_status, data= Poa_data, correlation=corPagel(1,Poa_tree, form = ~species))
+summary(pgls.mod.3)
+```
+
+
+include latitude as covariate
+```{r}
+pgls.mod.1 <- gls(log_range_size ~ endophyte_status + latitude, data= Poa_data, correlation=corPagel(1,Poa_tree, form = ~species))
+summary(pgls.mod.1)
+```
+
+```{r}
+pgls.mod.2 <- gls(log_primary_axis_range ~ endophyte_status + latitude, data= Poa_data, correlation=corPagel(1,Poa_tree, form = ~species))
+summary(pgls.mod.2)
+```
+
+```{r}
+pgls.mod.3 <- gls(log_hypervolumevolume ~ endophyte_status + latitude, data= Poa_data, correlation=corPagel(1,Poa_tree, form = ~species))
+summary(pgls.mod.3)
+```
+
