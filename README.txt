@@ -1,4 +1,4 @@
-Supplementary data and code for "Mutualistic microbes drive niche expansion yet constrain diversification"
+Supplementary data and code for "Mutualistic microbes linked with broader niches but reduced diversification"
 
 
 ###############################################################################
