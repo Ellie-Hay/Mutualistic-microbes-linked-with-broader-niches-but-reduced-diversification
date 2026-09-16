@@ -1,0 +1,110 @@
+---
+title: "Hypervolumes"
+# output: html_notebook
+---
+
+generate hypervolumes for each Poa species, to use as one of our measures of niche breadth
+
+setup chunk
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+load packages
+```{r}
+# library(terra)
+library(ggplot2)
+library(hypervolume)
+library(enmSdmX)
+library(dplyr)
+```
+
+Poa occurrence records:
+```{r}
+poa_occ <- read.csv("occurrencerecords.csv")
+
+species_list <- unique(poa_occ$species)
+```
+
+load in the bioclimatic variables
+```{r}
+bio <- rast(c(paste0("data/processed/soil_clim_layers/bio", 1:19, ".tif"),
+              "data/processed/soil_clim_layers/nitrogen_0_30cm_mean.tif",
+              "data/processed/soil_clim_layers/soc_0_30cm_mean.tif",
+              "data/processed/soil_clim_layers/phh2o_0_5cm_mean_1000.tif",
+              "data/processed/soil_clim_layers/clay_0_5cm_mean_1000.tif",
+              "data/processed/soil_clim_layers/sand_0_5cm_mean_1000.tif"
+              ))
+
+plot(bio)
+plot(bio[[17:25]])
+```
+
+reduce occs to have one record per grid cell per species and extract the env values for each record
+```{r}
+occurrence_env_data <- list()
+
+for (i in  1:length(species_list)) {
+    species_occ <- subset(poa_occ[,c("species","decimalLongitude","decimalLatitude")], poa_occ$species == species_list[i]) 
+    reduced_occ <- elimCellDuplicates(species_occ, bio[[1]], longLat = c('decimalLongitude', 'decimalLatitude'))
+    reduced_occ.1 <- terra::extract(bio, reduced_occ[,2:3]) 
+    occ_values_env <- reduced_occ.1[complete.cases(reduced_occ.1), ]
+    occ_values_env$ID <- species_list[i]
+    
+    occurrence_env_data[[i]] <- occ_values_env
+    
+}
+
+occurrence_env_df <- bind_rows(occurrence_env_data)
+occurrence_env_df
+
+```
+
+PCA of the data
+```{r}
+hv_pca<- prcomp(occurrence_env_df[, c(2:25)])
+
+hv_pca
+summary(hv_pca)
+```
+
+
+```{r}
+var_explained = hv_pca$sdev^2 / sum(hv_pca$sdev^2)
+
+qplot(c(4:27), var_explained) + 
+  geom_line() + 
+  xlab("Principal Component") + 
+  ylab("Variance Explained") +
+  ggtitle("Scree Plot") +
+  ylim(0, max(var_explained))
+```
+
+```{r}
+pca_df <- cbind(species = occurrence_env_df$ID, as.data.frame(hv_pca$x[, 1:4]))
+pca_df
+```
+
+use the first 4 PCs to calculate hypervolumes
+```{r}
+# Empty vector to store volumes
+hv_volumes <- data.frame(species = character(), volume = numeric())
+
+for (i in 1:length(species_list)) {
+  # Subset the data for this species
+  species_data <- subset(pca_df[,2:5], pca_df$species == species_list[i]) 
+  
+  hv <- hypervolume(species_data)
+  
+  # Save volume
+  hv_volumes <- rbind(hv_volumes, data.frame(species = species_list[i], volume = get_volume(hv)))
+
+}
+
+# View result
+print(hv_volumes)
+
+# Optional: Save to CSV
+write.csv(hv_volumes, "output/hypervolume_estimates.csv", row.names = FALSE)
+```
+

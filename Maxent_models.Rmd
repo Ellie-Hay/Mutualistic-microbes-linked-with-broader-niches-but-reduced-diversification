@@ -1,0 +1,500 @@
+---
+title: "Maxent models"
+# output: html_notebook
+---
+
+
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+
+load packages
+```{r}
+library(dplyr)
+library(terra) 
+library(predicts)
+library(rJava)
+library(ggplot2)
+library(stringr)
+```
+
+
+
+Load in the data I need for the analysis: 
+```{r}
+# 1. cleaned occurrence records for the 100 spp I want to do the models for:
+poa_occ <- read.csv("data/processed/Poa_occurrence_records.csv")
+poa_occ
+
+# 2. background points to sample - all occurrence records for all grass species
+background_occ <- read.csv("data/processed/Poaceae_backgroundpoints.csv")
+background_occ
+
+# 3. buffer distances 
+buffer_dist <- read.csv("data/processed/buffer_distances.csv")
+buffer_dist
+```
+
+
+Worldclim and soil layers:
+```{r}
+bio <- rast(c(paste0("data/processed/soil_clim_layers/bio", 1:19, ".tif"),
+              "data/processed/soil_clim_layers/nitrogen_0_30cm_mean.tif",
+              "data/processed/soil_clim_layers/soc_0_30cm_mean.tif",
+              "data/processed/soil_clim_layers/phh2o_0_5cm_mean_1000.tif",
+              "data/processed/soil_clim_layers/clay_0_5cm_mean_1000.tif",
+              "data/processed/soil_clim_layers/sand_0_5cm_mean_1000.tif"
+              ))
+
+plot(bio)
+plot(bio[[17:25]])
+```
+
+
+Editing the data for analysis
+```{r}
+#get a list of species names
+species_list <- unique(poa_occ$species)
+
+#create a spatial vector of the poa occurrence records
+poa_occ_sv <- terra::vect(poa_occ, geom = c("decimalLongitude", "decimalLatitude"), crs = "EPSG:4326")
+
+# Will do the same for the background points
+back_occ_sv <- terra::vect(background_occ, geom = c("decimalLongitude", "decimalLatitude"), crs = "EPSG:4326")
+
+#I will be calculating buffers and ranges based on this, this needs to be in a planar projection to work properly, so convert
+#create set of planar coordinates for buffer calculation
+poa_occ_planar <- terra::project(poa_occ_sv, "+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")  # Reproject to target CRS
+
+#background points get trimmed to this too
+back_occ_planar <- terra::project(back_occ_sv, "+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")  # Reproject to target CRS
+
+#the raster layers also get trimmed to the ranges, so this needs to be reprojected too, I just need one layer for this, the reprojection influences the resolution of the raster layers, so I will later go back to using the original layers. 
+bio_planar <- terra::project(bio[[1]], "+proj=robin +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs") # PROGRESS BAR
+```
+
+
+setting up the betas and dataframe for saving output from the models
+```{r}
+##make sequence of betas to use
+betas <- array(dim = c(24, 2))
+betas[,1] <- "betamultiplier="
+betas[,2] <- c(seq(0.2,1, 0.2), seq(2, 20, 1))
+betas <- data.frame(betas)
+betas[,3] <- paste(betas[,1], betas[,2],sep = '')
+names(betas)[3] <- 'setbeta'
+betas[,2] <- as.character(betas[,2])
+
+#make output data frame for beta results
+bestbetas <- data.frame(array(dim = c(length(species_list), 5)))
+names(bestbetas) <- c('species','no.pres','no.params default','no.params best','bestbeta')
+
+#make output data frame for all summary results
+final.summary <- data.frame(array(dim = c(length(species_list), 121)))
+names(final.summary) <-
+  c(
+    'species',
+    'no.pres',
+    'no.background',
+    'train.AUC',
+    'test.AUC',
+    'geo.ext.area.sqkm',
+    'maxss.threshold',
+    'MTP.threshold',
+    'MTP.10.percent.threshold',
+    'maxss.range.size.sqkm',
+    'MTP.range.size.sqkm',
+    'MTP10.range.size.sqkm',
+    'top.var.contribution',
+    'max.top.contribution',
+    'min.top.contribution',
+    'top.var.importance',
+    'max.top.importance',
+    'min.top.importance',
+    paste(paste0("bio", c(1, 10:19, 2:9)), "contribution", sep = "."), #to match order in maxentResults files
+    'clay_0_5cm_mean_1000.contribution',
+    'nitrogen_0_30cm_mean.contribution',
+    'phh2o_0_5cm_mean_1000.contribution',
+    'sand_0_5cm_mean_1000.contribution',
+    'soc_0_30cm_mean.contribution',
+    paste(paste0("bio", c(1, 10:19, 2:9)), "permutation.importance", sep = "."),
+    'clay_0_5cm_mean_1000.permutation.importance',
+    'nitrogen_0_30cm_mean.permutation.importance',
+    'phh2o_0_5cm_mean_1000.permutation.importance',
+    'sand_0_5cm_mean_1000.permutation.importance',
+    'soc_0_30cm_mean.permutation.importance',
+    paste("max.suit.bio", 1:19, sep = "."),
+    'max.suit.clay_0_5cm_mean_1000',
+    'max.suit.nitrogen_0_30cm_mean',
+    'max.suit.phh2o_0_5cm_mean_1000',
+    'max.suit.sand_0_5cm_mean_1000',    
+    'max.suit.soc_0_30cm_mean',
+    paste("min.suit.bio", 1:19, sep = "."),
+    'min.suit.clay_0_5cm_mean_1000',
+    'min.suit.nitrogen_0_30cm_mean',
+    'min.suit.phh2o_0_5cm_mean_1000',
+    'min.suit.sand_0_5cm_mean_1000',
+    'min.suit.soc_0_30cm_mean',
+    'second.var.contribution',
+    'max.second.contribution',
+    'min.second.contribution',
+    'second.var.importance',
+    'max.second.importance',
+    'min.second.importance',
+    'was_null_better'
+  )
+```
+
+
+
+
+```{r}
+for (i in 1:length(species_list)) {
+  tryCatch({
+ ### Preparing the input data for the models ###
+    
+     
+    ### occurrence records
+    
+    occ <- subset(poa_occ_sv, poa_occ_sv$species == species_list[i]) # model input
+    occ.df <- as.data.frame(occ, geom = "XY")
+    occ.df <-occ.df[,c('x','y')] 
+
+
+    # generate range buffer around species occurrence records for background points and prediction layers
+    occ_p <- subset(poa_occ_planar, poa_occ_planar$species == species_list[i]) # planar projection
+
+    # make range polygon - here I am using the buffer distances to buffer around the occurrence records
+    dist <- as.numeric(buffer_dist[buffer_dist$species == species_list[i], "distance_km"])
+    range <- terra::buffer(occ_p, width = (dist * 1000)) %>% terra::aggregate() # *1000 bc this crs uses meters
+    
+    
+    
+    ### prediction layers
+    
+    # clip predictor raster to the range polygon
+    preds_planar <- terra::crop(bio_planar, ext(range)) %>% terra::mask(range) # PROGRESS BAR
+    
+    #convert back to lat/long, and then crop the original bioclim layers to this - this will be used directly in the maxent model
+    preds_epsg <- terra::project(preds_planar, "epsg:4326") # PROGRESS BAR
+    bio_cropped <- terra::crop(bio, terra::ext(preds_epsg))
+    preds_epsg_resampled <- terra::resample(preds_epsg, bio_cropped, method = "bilinear")
+    preds <- terra::mask(bio_cropped, preds_epsg_resampled)
+    
+
+    
+    ### background points
+    
+    # clip all occurrences to range polygon for background points
+    extracted_values <- terra::extract(range, back_occ_planar)
+    
+    # Keep only points where extraction returned a non-NA value
+    background <- back_occ_planar[!is.na(extracted_values[, 2]), ]
+    
+    # sample just 10,000 occ if over
+    if (nrow(background) > 10000)
+      background <- background[sample(nrow(background),10000),]
+
+    back <- terra::project(background, "epsg:4326")
+    back.df <- as.data.frame(back, geom = "XY")
+    back.df <-back.df[,c('x','y')] 
+    
+
+    ### setting up the betas ###
+    allbetas <- data.frame(array(dim = c(24, 7)))
+    names(allbetas) <- c('species',
+                         'beta',
+                         'no.params',
+                         'no.pres',
+                         'loglik',
+                         'AIC',
+                         'AICc')
+    
+    allbetas[, 1] <- species_list[i]
+    
+    
+    ### Now for the MaxEnt model
+    
+    # will run this across all the betas and then save and compare the output, then will repeat the model over the best beta
+    
+    for(k in 1:nrow(betas)){
+      xm <- MaxEnt(x = preds,
+                   p = occ.df,
+                   a = back.df,
+                   args = c(betas[k, "setbeta"],
+                            "responsecurves=TRUE",
+                            "writebackgroundpredictions=TRUE"),
+                   path = paste0("output/MaxEnt_soillayers/",species_list[i]))
+      
+      #load in the output that has the lambdas
+      lambda <- read.csv(paste0("output/MaxEnt_soillayers/",species_list[i],"/species.lambdas"), header = F)
+      lambda <- lambda[-((nrow(lambda) - 3):nrow(lambda)), ] #remove the last few rows, this data isn't relevant here
+    
+      # read and write predictions at presences, save this for each of the betas
+      pres.raw <- read.csv(paste0("output/MaxEnt_soillayers/",species_list[i],"/species_samplePredictions.csv"))
+      write.csv(pres.raw, paste0("output/MaxEnt_soillayers/",species_list[i],"/",species_list[i],"_",betas[k, "X2"],"_pres.predictions.csv"))
+      
+      
+      ### calculate AICc ###
+      no.params <- length(which(lambda$V2 != 0))
+      no.pres <- xm@results[1]
+      loglik <- sum(log(pres.raw$Raw.prediction))
+      AIC <- (2 * no.params) - (2 * loglik)
+      AICc <- AIC + (((2 * no.params) * (no.params + 1)) / (no.pres - no.params - 1))
+      
+      #save this for each individual beta value
+      allbetas[k, 2:7]<-c(betas[k, "X2"], no.params, no.pres, loglik, AIC, AICc)
+      
+     #repeat the maxent models over the different betas 
+      }
+    
+    write.csv(back.df, paste0("output/MaxEnt_soillayers/",species_list[i],"/",species_list[i],"_backgroundpoints.csv"))
+    write.csv(occ.df, paste0("output/MaxEnt_soillayers/",species_list[i],"/",species_list[i],"_presencepoints.csv"))
+
+    
+    ### save output on betas ###
+    write.csv(allbetas, paste0("output/MaxEnt_soillayers/",species_list[i],"/allbetas.csv"))
+    
+    # now I need to get the best beta (based on the AIC) and will run and save the model from the best beta
+    
+    #need to transform this to numeric
+    allbetas$no.params<-as.numeric(allbetas$no.params)
+    allbetas$no.pres<-as.numeric(allbetas$no.pres)
+    allbetas$beta<-as.numeric(allbetas$beta)
+
+    # find best beta and save in bestbetas file
+    bestbetas[i, 1] <- as.character(allbetas$species[1])
+    bestbetas[i, 2] <- allbetas$no.pres[1]
+    bestbetas[i, 3] <- allbetas[which(allbetas$beta == 1), 'no.params']
+    
+    if (max(allbetas$no.pres) > min(allbetas$no.params))
+      bestbetas[i, 5] <- min(allbetas[which(allbetas$AICc == min(allbetas[which(allbetas$no.params < allbetas$no.pres &
+                                                               allbetas$no.params > 0), 'AICc'])), 'beta'])
+    
+    if ((max(allbetas$no.pres) > min(allbetas$no.params)))
+      bestbetas[i, 4] <- allbetas[which(allbetas$beta == bestbetas[i, 5]), 'no.params']
+    
+    final.summary[i,121]<-FALSE
+    
+    if(allbetas[allbetas$beta==min(allbetas[which(allbetas$AICc == min(allbetas[which(allbetas$no.params <
+                                                                     allbetas$no.pres),'AICc'])),'beta']),"no.params"]==0){
+      final.summary[i,121]<-TRUE
+    }
+    
+    
+   ### BEST BETA MODEL
+    
+    xm <- MaxEnt(x = preds, 
+                 p = occ.df, 
+                 a = back.df, 
+                 args = c(betas[which(betas$X2 == bestbetas[i,"bestbeta"]),"setbeta"],
+                          "outputformat=logistic", 
+                          "responsecurves=true", 
+                          "replicates=10"),
+                 path = paste0("output/MaxEnt_soillayers/",species_list[i],"/bestbeta"))
+    
+    save(xm, file = paste0("output/MaxEnt_soillayers/",species_list[i],"/bestbeta/",species_list[i], "_",  bestbetas[i,"bestbeta"], "_xm.RData"))
+    
+
+    suitability <- predict(xm, preds)
+       
+    suit.average <- terra::mean(suitability, na.rm = TRUE)
+      
+    names(suit.average) <- paste(species_list[i], "habitat_suitability", sep = "_")
+
+       
+    #stack with predictors
+    maps <- c(preds, suit.average)
+  
+    #save
+    writeRaster(maps, paste0("output/MaxEnt_soillayers/",species_list[i],"/bestbeta/", species_list[i], '_map_outputs.tif'), overwrite = TRUE)
+       
+       
+  # start filling in final summary -----------------------------------------------
+    
+   # read in maxent results file
+    max.results <- read.csv(paste0("output/MaxEnt_soillayers/",species_list[i],"/bestbeta/maxentResults.csv")) %>% filter(Species == "species (average)")
+    
+    final.summary[i, 1:2] <- bestbetas[i, 1:2]
+    final.summary[i, 3:5] <- max.results[c("X.Background.points", "Training.AUC", "Test.AUC")]
+    
+    
+    #calculate area of geo extent (using preds raster to remove water area)
+    extent_area <- expanse(preds[[1]], unit="km")
+    final.summary[i, 6] <- extent_area$area
+    
+    final.summary[i, 7:9] <- max.results[c("Maximum.test.sensitivity.plus.specificity.Logistic.threshold",
+                                  "Minimum.training.presence.Logistic.threshold",
+                                  "X10.percentile.training.presence.Logistic.threshold")]
+    
+    # get area of suitable habitat (i.e., range size) using the three different thresholds
+    suit.average.maxss <- suit.average # to preserve elements of suitability map
+    
+    suit.average.maxss[suit.average.maxss < final.summary[i, "maxss.threshold"]] <- NA
+    suit_area <- expanse(suit.average.maxss, unit="km")
+    final.summary[i, 10] <- suit_area$area
+    
+    suit.average.mtp <- suit.average # to preserve elements of suitability map
+    
+    suit.average.mtp[suit.average.mtp < final.summary[i, "MTP.threshold"]] <- NA
+    suit_area <- expanse(suit.average.mtp, unit="km")
+    final.summary[i, 11] <- suit_area$area
+    
+    suit.average.mtp10 <- suit.average # to preserve elements of suitability map
+    
+    suit.average.mtp10[suit.average.mtp10 < final.summary[i, "MTP.10.percent.threshold"]] <- NA
+    suit_area <- expanse(suit.average.mtp10, unit="km")
+    final.summary[i, 12] <- suit_area$area
+    
+    
+    
+     #get most important variable and extract values @ all points
+    
+    if(length(max.results %>%
+              dplyr::select(Species, contains("permutation")) %>%
+              filter(Species == "species (average)") %>%
+              data.frame(variable = names(.[2:length(.)]), average = as.numeric(.[1,2:length(.)])) %>%
+              dplyr::select(variable, average) %>%
+              filter(average == max(average)) %>%
+              pull(variable) %>%
+              str_sub(end = -24))==1){
+      
+      ## contribution
+      final.summary[i, 13] <- max.results %>%
+        dplyr::select(Species, contains("contribution")) %>%
+        filter(Species == "species (average)") %>%
+        data.frame(variable = names(.[2:length(.)]), average = as.numeric(.[1,2:length(.)])) %>%
+        dplyr::select(variable, average) %>%
+        filter(average == max(average)) %>%
+        pull(variable) %>%
+        str_sub(end = -14)
+      
+      top.cont.values <- terra::extract(preds[[final.summary[i,13]]], occ)
+      final.summary[i, 14] <- max(top.cont.values, na.rm = TRUE)
+      final.summary[i, 15] <- min(top.cont.values, na.rm = TRUE)
+      
+      ## permutation imp
+      final.summary[i, 16] <- max.results %>%
+        dplyr::select(Species, contains("permutation")) %>%
+        filter(Species == "species (average)") %>%
+        data.frame(variable = names(.[2:length(.)]), average = as.numeric(.[1,2:length(.)])) %>%
+        dplyr::select(variable, average) %>%
+        filter(average == max(average)) %>%
+        pull(variable) %>%
+        str_sub(end = -24)
+      
+      top.perm.values <- terra::extract(preds[[final.summary[i, 16]]], occ)
+      final.summary[i, 17] <- max(top.perm.values, na.rm = TRUE)
+      final.summary[i, 18] <- min(top.perm.values, na.rm = TRUE)
+      
+    } else if(length(max.results %>%
+                     dplyr::select(Species, contains("permutation")) %>%
+                     filter(Species == "species (average)") %>%
+                     data.frame(variable = names(.[2:length(.)]), average = as.numeric(.[1,2:length(.)])) %>%
+                     dplyr::select(variable, average) %>%
+                     filter(average == max(average)) %>%
+                     pull(variable) %>%
+                     str_sub(end = -24))==2){
+      
+      ## contribution
+      final.summary[i, 13] <- max.results %>%
+        dplyr::select(Species, contains("contribution")) %>%
+        filter(Species == "species (average)") %>%
+        data.frame(variable = names(.[2:length(.)]), average = as.numeric(.[1,2:length(.)])) %>%
+        dplyr::select(variable, average) %>%
+        filter(average == max(average)) %>%
+        pull(variable) %>%
+        str_sub(end = -14)[1]
+      
+      top.cont.values <- terra::extract(preds[[final.summary[i, 13]]], occ)
+      final.summary[i, 14] <- max(top.cont.values, na.rm = TRUE)
+      final.summary[i, 15] <- min(top.cont.values, na.rm = TRUE)
+      
+      ## permutation imp
+      final.summary[i, 16] <- max.results %>%
+        dplyr::select(Species, contains("permutation")) %>%
+        filter(Species == "species (average)") %>%
+        data.frame(variable = names(.[2:length(.)]), average = as.numeric(.[1,2:length(.)])) %>%
+        dplyr::select(variable, average) %>%
+        filter(average == max(average)) %>%
+        pull(variable) %>%
+        str_sub(end = -24)[1]
+      
+      top.perm.values <- terra::extract(preds[[final.summary[i, 16]]], occ)
+      final.summary[i, 17] <- max(top.perm.values, na.rm = TRUE)
+      final.summary[i, 18] <- min(top.perm.values, na.rm = TRUE)
+      
+      ## contribution
+      final.summary[i, 115] <- max.results %>%
+        dplyr::select(Species, contains("contribution")) %>%
+        filter(Species == "species (average)") %>%
+        data.frame(variable = names(.[2:length(.)]), average = as.numeric(.[1,2:length(.)])) %>%
+        dplyr::select(variable, average) %>%
+        filter(average == max(average)) %>%
+        pull(variable) %>%
+        str_sub(end = -14)[2]
+      
+      top.cont.values <- terra::extract(preds[[final.summary[i, 115]]], occ)
+      final.summary[i, 116] <- max(top.cont.values, na.rm = TRUE)
+      final.summary[i, 117] <- min(top.cont.values, na.rm = TRUE)
+      
+      ## permutation imp
+      final.summary[i, 118] <- max.results %>%
+        dplyr::select(Species, contains("permutation")) %>%
+        filter(Species == "species (average)") %>%
+        data.frame(variable = names(.[2:length(.)]), average = as.numeric(.[1,2:length(.)])) %>%
+        dplyr::select(variable, average) %>%
+        filter(average == max(average)) %>%
+        pull(variable) %>%
+        str_sub(end = -24)[2]
+      
+      top.perm.values <- terra::extract(preds[[final.summary[i, 118]]], occ)
+      final.summary[i, 119] <- max(top.perm.values, na.rm = TRUE)
+      final.summary[i, 120] <- min(top.perm.values, na.rm = TRUE)
+    } else{
+      final.summary[i, c(13:18)]<-rep(NA, 6)
+      final.summary[i, c(115:120)]<-rep(NA, 6)
+    }
+    
+    #now paste raw contribution/importance for all vars
+    final.summary[i, 19:66] <- max.results[12:59]
+    
+    #now get max/min of all predictor vars within suitable habitat using maxss
+    preds.suit <- preds[!is.na(suit.average.maxss)] %>% as.data.frame()
+    for (k in 1:19){
+      final.summary[i, paste0("max.suit.bio.", k)] <- max(preds.suit[paste0("bio", k)], na.rm = TRUE)
+      final.summary[i, paste0("min.suit.bio.", k)] <- min(preds.suit[paste0("bio", k)], na.rm = TRUE)
+    }
+    
+    
+    final.summary[i, 'max.suit.clay_0_5cm_mean_1000'] <- max(preds.suit['clay_0_5cm_mean_1000'], na.rm = TRUE)
+    final.summary[i, 'max.suit.nitrogen_0_30cm_mean'] <- max(preds.suit['nitrogen_0_30cm_mean'], na.rm = TRUE)
+    final.summary[i, 'max.suit.phh2o_0_5cm_mean_1000'] <- max(preds.suit['phh2o_0_5cm_mean_1000'], na.rm = TRUE)
+    final.summary[i, 'max.suit.sand_0_5cm_mean_1000'] <- max(preds.suit['sand_0_5cm_mean_1000'], na.rm = TRUE)
+    final.summary[i, 'max.suit.soc_0_30cm_mean'] <- max(preds.suit['soc_0_30cm_mean'], na.rm = TRUE)
+    
+    
+    final.summary[i, 'min.suit.clay_0_5cm_mean_1000'] <- min(preds.suit['clay_0_5cm_mean_1000'], na.rm = TRUE)
+    final.summary[i, 'min.suit.nitrogen_0_30cm_mean'] <- min(preds.suit['nitrogen_0_30cm_mean'], na.rm = TRUE)
+    final.summary[i, 'min.suit.phh2o_0_5cm_mean_1000'] <- min(preds.suit['phh2o_0_5cm_mean_1000'], na.rm = TRUE)
+    final.summary[i, 'min.suit.sand_0_5cm_mean_1000'] <- min(preds.suit['sand_0_5cm_mean_1000'], na.rm = TRUE)
+    final.summary[i, 'min.suit.soc_0_30cm_mean'] <- min(preds.suit['soc_0_30cm_mean'], na.rm = TRUE)
+    
+    
+    #save for each species
+    write.csv(bestbetas[i,], paste0("output/MaxEnt_soillayers/",species_list[i],"/bestbeta/", species_list[i],"_beta_params.csv"))
+    write.csv(final.summary[i,], paste0("output/MaxEnt_soillayers/",species_list[i],"/bestbeta/", species_list[i],"_final_summary.csv"))
+  
+  })
+}
+
+
+write.csv(bestbetas, paste0("output/MaxEnt_soillayers/beta_params.csv"))
+write.csv(final.summary, paste0("output/MaxEnt_soillayers/final_summary.csv"))
+
+```
+
+
+
+

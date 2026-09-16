@@ -1,0 +1,100 @@
+---
+title: "R Notebook"
+# output: html_notebook
+---
+
+setup chunk
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r}
+library(brms)
+library(ape)       
+library(tidyverse)
+```
+
+load data
+```{r}
+Poa_data <- read.csv("data/Poa_data.csv")
+Poa_data
+```
+
+```{r}
+tree <- read.tree("data/treefile.nex")
+tree
+```
+
+match the data to the tree
+```{r}
+rownames(Poa_data) <- Poa_data$WCVP_list
+
+matched_tree_df <- picante::match.phylo.data(tree, Poa_data)
+
+
+Poa_tree <- matched_tree_df$phy
+Poa_data_reduced <- matched_tree_df$data
+Poa_data_reduced
+
+Poa_data_reduced$Endophyte_status <- as.integer(Poa_data_reduced$Endophyte_status)
+Poa_data_reduced$log_top.var.range <- as.numeric(Poa_data_reduced$log_top.var.range)
+
+Poa_data_reduced[, 8:20] <- lapply(Poa_data_reduced[, 8:20], function(x) as.numeric(x))
+
+Poa_data_reduced[, 125:160] <- lapply(Poa_data_reduced[, 125:160], function(x) as.numeric(x))
+head(Poa_data_reduced)
+```
+
+
+```{r}
+poa_traits <- Poa_data_reduced %>%
+  dplyr::select(species = WCVP_list, Endophyte_status, log_maxss.range.size.sqkm, log_volume, log_top.var.range, centroid_latitude, bio1, bio4, bio5, bio10, bio12, bio15, nitrogen_0_30cm_mean, soc_0_30cm_mean, phh2o_0_5cm_mean_1000, clay_0_5cm_mean_1000, sand_0_5cm_mean_1000)
+
+poa_traits
+```
+
+rescale for using default/loosely informative priors
+```{r}
+poa_traits[, 3:22] <- lapply(poa_traits[, 3:22], function(x) {
+  (x - mean(x)) / sd(x)
+})
+```
+
+
+```{r}
+A <- ape::vcv.phylo(Poa_tree)
+```
+
+              
+```{r}
+set.seed(12345)
+
+Endophyte_mod <- brm(Endophyte_status ~ bio1 + bio12 + nitrogen_0_30cm_mean + clay_0_5cm_mean_1000 + 
+                       (1 | gr(species, cov = A)),
+                        data = poa_traits,
+                        family = bernoulli(link = "logit"),
+                        data2 = list(A = A),
+                        chains = 4,
+                        cores = 4,
+                        iter = 2000,
+                        prior = c(
+                          prior(normal(0,1), "b")
+                        ),
+                        backend = "cmdstanr")
+
+
+Endophyte_mod
+```  
+                
+                
+```{r, fig.asp = 1}
+plot(Endophyte_mod, ask = FALSE)
+pp_check(Endophyte_mod)
+prior_summary(Endophyte_mod)
+```        
+
+```{r}
+jtools::plot_summs(Endophyte_mod, colors = "black", ci_level = 0.95) + xlim(-3,3)+
+  theme_classic()
+```
+

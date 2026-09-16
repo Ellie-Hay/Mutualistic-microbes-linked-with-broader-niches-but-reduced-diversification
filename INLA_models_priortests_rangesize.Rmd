@@ -1,0 +1,1121 @@
+---
+title: "R Notebook"
+# output: html_notebook
+---
+
+Poa INLA model - this is the script testing the influence of endophytes on range size. This goes over different phylogenetic priors, meshes, and spatial priors. The exact same models were also run for our other niche breadth variables: range on the primary niche axis and hypervolume. 
+
+These models were also used to test how environmental variables structure endophyte presence - this is the same script (tested the same priors and meshes) but those models use a binomial family. 
+
+
+
+setup chunk
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+
+```{r}
+library(INLA)
+library(ape)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(viridis)
+```
+
+
+load in data
+```{r}
+trait_data <- read.csv("data/processed/Poa_data.csv")
+occ_data <- read.csv("data/processed/Poa_occurrence_records.csv")
+phy <- read.tree("data/processed/Poa_tree.nex")
+```
+
+
+have a look at the occurrence data - I am having to rewrite this script to use terra
+```{r}
+#load in background map for plotting
+coast <- read_sf("data/raw/ne_50m_land.shp")
+
+ggplot() + geom_sf(data = coast, colour = "black", fill = NA) + geom_point(aes(x=decimalLongitude, y=decimalLatitude), occ_data, size=0.1, colour= "red")
+```
+
+
+
+Match all the data to the tree:
+```{r}
+rownames(trait_data) <- trait_data$WCVP_list
+
+matched_tree_df <- picante::match.phylo.data(phy, trait_data)
+
+Poa_tree <- matched_tree_df$phy
+Poa_data_reduced <- matched_tree_df$data
+
+Poa_data_reduced$Endophyte_status <- as.integer(Poa_data_reduced$Endophyte_status)
+
+Poa_data_reduced$log_maxss.range.size.sqkm <- as.numeric(Poa_data_reduced$log_maxss.range.size.sqkm)
+Poa_data_reduced$log_top.var.range <- as.numeric(Poa_data_reduced$log_top.var.range)
+Poa_data_reduced$log_volume <- as.numeric(Poa_data_reduced$log_volume)
+Poa_data_reduced$centroid_latitude <- as.numeric(Poa_data_reduced$centroid_latitude)
+
+
+Poa_data_reduced$bio1 <- as.numeric(Poa_data_reduced$bio1)
+Poa_data_reduced$bio12 <- as.numeric(Poa_data_reduced$bio12)
+Poa_data_reduced$nitrogen_0_30cm_mean <- as.numeric(Poa_data_reduced$nitrogen_0_30cm_mean)
+Poa_data_reduced$clay_0_5cm_mean_1000 <- as.numeric(Poa_data_reduced$clay_0_5cm_mean_1000)
+```
+
+
+```{r}
+poa_occ <- occ_data %>%
+   dplyr::select(species, Long = decimalLongitude, Lat = decimalLatitude) %>% 
+   ## make sure species names use same format as traits 
+   transform(species = gsub(" ", "_", species)) 
+
+species_to_remove <- setdiff(unique(poa_occ$species), unique(phy$tip.label))
+
+poa_occ_filtered <- poa_occ[!poa_occ$species %in% species_to_remove, ]
+
+
+str(poa_occ)
+str(poa_occ_filtered)
+```
+
+
+```{r}
+poa_traits <- Poa_data_reduced %>%
+  dplyr::select(species = WCVP_list, Endophyte_status, log_maxss.range.size.sqkm,log_top.var.range,log_volume, centroid_latitude, bio1, bio12, nitrogen_0_30cm_mean, clay_0_5cm_mean_1000)
+
+
+poa_traits<- poa_traits %>% 
+  mutate(centroid_latitude_abs = abs(centroid_latitude),
+         log_maxss.range.size.sqkm_st = (log_maxss.range.size.sqkm - mean(log_maxss.range.size.sqkm)) / sd(log_maxss.range.size.sqkm),
+         log_top.var.range_st = (log_top.var.range - mean(log_top.var.range)) / sd(log_top.var.range),
+         log_volume_st = (log_volume - mean(log_volume)) / sd(log_volume),
+         centroid_latitude_st = (centroid_latitude - mean(centroid_latitude)) / sd(centroid_latitude),
+         bio1_st = (bio1 - mean(bio1)) / sd(bio1), 
+         bio12_st = (bio12 - mean(bio12)) / sd(bio12), 
+         nitrogen_0_30cm_mean_st = (nitrogen_0_30cm_mean - mean(nitrogen_0_30cm_mean)) / sd(nitrogen_0_30cm_mean),
+         clay_0_5cm_mean_1000_st = (clay_0_5cm_mean_1000 - mean(clay_0_5cm_mean_1000)) / sd(clay_0_5cm_mean_1000))
+
+
+poa_traits_occ <- left_join(poa_occ_filtered, poa_traits, by = "species")
+
+poa_traits_occ
+```
+
+
+Creating the phylogenetic precision matrix to use for the phylogenetic effect
+```{r}
+phylo_covar_mat <- ape::vcv(phy)
+phylo_covar_mat <- phylo_covar_mat/max(phylo_covar_mat)
+phylo_covar_mat <- phylo_covar_mat / exp(determinant(phylo_covar_mat)$modulus[1] /
+                                           nrow(phylo_covar_mat))
+
+phylo_prec_mat <- solve(phylo_covar_mat) 
+phylo_prec_mat[1:5, 1:5] 
+```
+
+
+```{r}
+poa_traits <- poa_traits %>%
+  left_join(tibble(species = rownames(phylo_prec_mat), 
+                   phy_id = 1:nrow(phylo_prec_mat)))
+```
+
+
+
+
+Setting the phylogenetic prior, will try a range of priors, first using a default prior
+```{r}
+pcprior <- list(prec = list(prior="pc.prec"))
+```
+
+
+Will first run an INLA model just with the phylogenetic effect
+```{r}
+Endophyte_model_phylo <- inla(log_maxss.range.size.sqkm_st ~ Endophyte_status +
+                                f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                              family = "gaussian",
+                              data = poa_traits,
+                              control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+)
+
+summary(Endophyte_model_phylo)
+```
+
+
+
+
+Testing other phylogentic priors
+```{r}
+pcprior <- list(prec = list(prior="pc.prec", param = c(0.5, 0.05)))
+```
+
+```{r}
+Endophyte_model_phylo <- inla(log_maxss.range.size.sqkm_st ~ Endophyte_status +
+                                f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                              family = "gaussian",
+                              data = poa_traits,
+                              control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+)
+
+summary(Endophyte_model_phylo)
+```
+
+
+
+
+```{r}
+pcprior <- list(prec = list(prior="pc.prec", param = c(1, 0.1)))
+```
+
+```{r}
+Endophyte_model_phylo <- inla(log_maxss.range.size.sqkm_st ~ Endophyte_status +
+                                f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                              family = "gaussian",
+                              data = poa_traits,
+                              control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+)
+
+summary(Endophyte_model_phylo)
+```
+
+
+
+
+
+```{r}
+pcprior <- list(prec = list(prior="pc.prec", param = c(1, 0.01)))
+```
+
+```{r}
+Endophyte_model_phylo <- inla(log_maxss.range.size.sqkm_st ~ Endophyte_status +
+                                f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                              family = "gaussian",
+                              data = poa_traits,
+                              control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+)
+
+summary(Endophyte_model_phylo)
+```
+
+
+
+
+
+
+```{r}
+pcprior <- list(prec = list(prior="pc.prec", param = c(1.5, 0.05)))
+```
+
+```{r}
+Endophyte_model_phylo <- inla(log_maxss.range.size.sqkm_st ~ Endophyte_status +
+                                f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                              family = "gaussian",
+                              data = poa_traits,
+                              control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+)
+
+summary(Endophyte_model_phylo)
+```
+
+ 
+
+
+```{r}
+pcprior <- list(prec = list(prior="pc.prec", param = c(1, 0.05)))
+```
+
+```{r}
+Endophyte_model_phylo <- inla(log_maxss.range.size.sqkm_st ~ Endophyte_status +
+                                f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                              family = "gaussian",
+                              data = poa_traits,
+                              control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+)
+
+summary(Endophyte_model_phylo)
+``` 
+ 
+ 
+ 
+ 
+ 
+
+
+Now to add in the spatial effect
+
+First, creating a mesh - will try a few:
+
+
+
+Mesh1
+```{r}
+coords <- st_as_sf(occ_data, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+
+boundary <- list(inla.nonconvex.hull(coords, 5, resolution=c(60,60), crs=4326),
+                 inla.nonconvex.hull(coords, 12, resolution=c(50,50), crs=4326 ))
+
+```
+
+```{r}
+## Build the mesh:
+spatial_mesh1 <- inla.mesh.2d(boundary=boundary, 
+                             max.edge=c(5, 12),
+                             # min.angle=30,
+                             cutoff= 3, ## Filter away adjacent points. 
+                             offset=c(1, 2))
+
+
+
+plot(spatial_mesh1)
+plot(spatial_mesh1); points(occ_data$decimalLongitude, occ_data$decimalLatitude, col="red", cex = 0.1)
+spatial_mesh1$n
+```
+
+setting the priors for the spatial effect - just using default prior for now
+```{r}
+spde <- inla.spde2.matern(mesh = spatial_mesh1, alpha = 2)
+```
+
+
+```{r}
+A <- inla.spde.make.A(spatial_mesh1, loc = coords)
+dim(A)
+
+row_counts <- rowSums(A != 0); head(row_counts)
+row_sums <- rowSums(A); head(row_sums)
+apply(A, 1, function(x) x[x > 0]) %>% t %>% head
+```
+
+
+```{r}
+specs <- poa_traits$species
+
+# Loop over species and compute one A-row per species
+spec_A_list <- lapply(specs, function(x) {
+  rows_x <- which(poa_traits_occ$species == x)
+  A_x <- A[rows_x, , drop = FALSE]
+  A_x_mean <- apply(A_x, 2, mean)
+
+  return(A_x_mean)
+})
+
+
+# Combine species rows into a single matrix
+spec_A_rows <- do.call(rbind, spec_A_list)
+
+## convert back to sparse matrix
+spec_A_rows <- Matrix(spec_A_rows, sparse = TRUE) 
+
+dim(spec_A_rows)
+apply(spec_A_rows, 1, sum) %>% head
+
+apply(spec_A_rows, 1, function(x) sum(x > 0)) 
+
+```
+
+
+```{r}
+stack <- inla.stack(data = list(resp = poa_traits$log_maxss.range.size.sqkm_st),
+                    A = list(spec_A_rows, 1, 1, 1), 
+                    effects=list(spat_id = 1:spde$n.spde,
+                                 phy_id = poa_traits$phy_id,
+                                 intercept = rep(1, nrow(poa_traits)), 
+                                 list(Endophyte = poa_traits$Endophyte_status
+                                      )), tag='est') 
+```
+
+
+```{r}
+## estimate spatial random effect for each species
+stck.loc <- inla.stack(data = list(resp = NA),
+                       A = list(spec_A_rows),
+                       effects = list(spat_id = 1:spde$n.spde), tag='loc') 
+
+## estimate phylogenetic random effect for each species
+stck.phy <- inla.stack(data = list(resp = NA), A = list(1),
+                       effects=list(phy_id = poa_traits$phy_id), tag='phy') 
+
+big_stack <- inla.stack(stack, stck.loc, stck.phy)
+```
+
+
+```{r}
+full_mod <- inla(resp ~ 0 + intercept + Endophyte +
+                   f(spat_id, model = spde) + ## spatial random effect
+                   f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                 family = "gaussian",
+                 data = inla.stack.data(big_stack, spde = spde),
+                 control.predictor = list(A = inla.stack.A(big_stack), compute = TRUE,
+                                          link = 1), 
+                 control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                 num.threads = 10 
+)
+
+summary(full_mod)
+```
+
+
+```{r}
+grid <- inla.mesh.projector(spatial_mesh, dims = c(501,501))
+
+
+prd_mean <- inla.mesh.project(grid, full_mod$summary.ran$spat_id$mean) 
+prd_sd <- inla.mesh.project(grid, full_mod$summary.ran$spat_id$sd)
+
+grid_df <- tibble(long = grid$lattice$loc[ , 1], 
+                  lat = grid$lattice$loc[ , 2],
+                  prediction_mean = as.vector(prd_mean), 
+                  prediction_sd = as.vector(prd_sd))
+```
+
+plot
+```{r}
+bbox <- st_bbox(coast, crs = "+proj=longlat +datum=WGS84 +no_defs")
+
+# Convert to sf polygon
+grid_sf <- st_as_sf(grid_df, coords = c("long", "lat"), crs = 4326)
+
+land <- st_union(coast)
+
+grid_crop <- grid_sf[st_intersects(grid_sf, land, sparse = FALSE), ]
+
+grid_crop <- grid_crop %>%
+  mutate(long = st_coordinates(grid_crop)[,1],
+         lat  = st_coordinates(grid_crop)[,2])
+
+spat_map <- ggplot(coast) +
+  geom_sf() +
+  geom_raster(data = grid_crop, aes(x = long, y = lat, fill = prediction_mean)) + 
+  # geom_sf(data = sea, fill = "white") +
+  scale_fill_viridis(name = "Spatial effect", na.value = NA) + 
+  theme_map() 
+
+spat_map
+```
+
+
+
+
+
+
+
+Mesh 2
+
+```{r}
+coords <- st_as_sf(occ_data, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+
+boundary <- list(inla.nonconvex.hull(coords, 4, resolution=c(100,100), crs=4326),
+                 inla.nonconvex.hull(coords, 8, resolution=c(80,80), crs=4326 ))
+
+```
+
+```{r}
+## Build the mesh:
+spatial_mesh2 <- inla.mesh.2d(boundary=boundary, 
+                             max.edge=c(2, 10),
+                             # min.angle=30,
+                             cutoff= 2, ## Filter away adjacent points. 
+                             offset=c(1, 2)
+                             )
+
+
+
+plot(spatial_mesh2)
+plot(spatial_mesh2); points(occ_data$decimalLongitude, occ_data$decimalLatitude, col="red", cex = 0.1)
+spatial_mesh2$n
+```
+
+setting the priors for the spatial effect
+```{r}
+spde <- inla.spde2.matern(mesh = spatial_mesh2, alpha = 2)
+```
+
+
+```{r}
+A <- inla.spde.make.A(spatial_mesh2, loc = coords)
+dim(A)
+
+row_counts <- rowSums(A != 0); head(row_counts)
+row_sums <- rowSums(A); head(row_sums)
+apply(A, 1, function(x) x[x > 0]) %>% t %>% head
+```
+
+
+```{r}
+specs <- poa_traits$species
+
+# Loop over species and compute one A-row per species
+spec_A_list <- lapply(specs, function(x) {
+  rows_x <- which(poa_traits_occ$species == x)
+  A_x <- A[rows_x, , drop = FALSE]
+  A_x_mean <- apply(A_x, 2, mean)
+
+  return(A_x_mean)
+})
+
+
+# Combine species rows into a single matrix
+spec_A_rows <- do.call(rbind, spec_A_list)
+
+## convert back to sparse matrix
+spec_A_rows <- Matrix(spec_A_rows, sparse = TRUE) 
+
+dim(spec_A_rows)
+apply(spec_A_rows, 1, sum) %>% head
+
+apply(spec_A_rows, 1, function(x) sum(x > 0)) 
+
+```
+
+
+```{r}
+stack <- inla.stack(data = list(resp = poa_traits$log_maxss.range.size.sqkm_st),
+                    A = list(spec_A_rows, 1, 1, 1), 
+                    effects=list(spat_id = 1:spde$n.spde,
+                                 phy_id = poa_traits$phy_id,
+                                 intercept = rep(1, nrow(poa_traits)), 
+                                 list(Endophyte = poa_traits$Endophyte_status
+                                      )), tag='est') 
+```
+
+
+```{r}
+## estimate spatial random effect for each species
+stck.loc <- inla.stack(data = list(resp = NA),
+                       A = list(spec_A_rows),
+                       effects = list(spat_id = 1:spde$n.spde), tag='loc') 
+
+## estimate phylogenetic random effect for each species
+stck.phy <- inla.stack(data = list(resp = NA), A = list(1),
+                       effects=list(phy_id = poa_traits$phy_id), tag='phy') 
+
+big_stack <- inla.stack(stack, stck.loc, stck.phy)
+```
+
+
+```{r}
+full_mod <- inla(resp ~ 0 + intercept + Endophyte +
+                   f(spat_id, model = spde) + ## spatial random effect
+                   f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                 family = "gaussian",
+                 data = inla.stack.data(big_stack, spde = spde),
+                 control.predictor = list(A = inla.stack.A(big_stack), compute = TRUE,
+                                          link = 1), 
+                 control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                 num.threads = 10 
+)
+
+summary(full_mod)
+```
+
+
+```{r}
+grid <- inla.mesh.projector(spatial_mesh2, dims = c(501,501))
+
+
+prd_mean <- inla.mesh.project(grid, full_mod$summary.ran$spat_id$mean) 
+prd_sd <- inla.mesh.project(grid, full_mod$summary.ran$spat_id$sd)
+
+grid_df <- tibble(long = grid$lattice$loc[ , 1], 
+                  lat = grid$lattice$loc[ , 2],
+                  prediction_mean = as.vector(prd_mean), 
+                  prediction_sd = as.vector(prd_sd))
+```
+
+
+```{r}
+bbox <- st_bbox(coast, crs = "+proj=longlat +datum=WGS84 +no_defs")
+
+# Convert to sf polygon
+grid_sf <- st_as_sf(grid_df, coords = c("long", "lat"), crs = 4326)
+
+land <- st_union(coast)
+
+grid_crop <- grid_sf[st_intersects(grid_sf, land, sparse = FALSE), ]
+
+grid_crop <- grid_crop %>%
+  mutate(long = st_coordinates(grid_crop)[,1],
+         lat  = st_coordinates(grid_crop)[,2])
+
+spat_map <- ggplot(coast) +
+  geom_sf() +
+  geom_raster(data = grid_crop, aes(x = long, y = lat, fill = prediction_mean)) + 
+  # geom_sf(data = sea, fill = "white") +
+  scale_fill_viridis(name = "Spatial effect", na.value = NA) + 
+  theme_map() 
+
+spat_map
+```
+
+
+
+
+
+Mesh 3
+```{r}
+coords <- st_as_sf(occ_data, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+
+boundary <- list(inla.nonconvex.hull(coords, 2, resolution=c(200,200), crs=4326),
+                 inla.nonconvex.hull(coords, 8, resolution=c(100,100), crs=4326 ))
+
+```
+
+```{r}
+## Build the mesh:
+spatial_mesh3 <- inla.mesh.2d(boundary=boundary, 
+                             max.edge=c(1, 8),
+                             cutoff= 1, ## Filter away adjacent points. 
+                             offset=c(1, 2))
+
+
+
+plot(spatial_mesh3)
+plot(spatial_mesh3); points(occ_data$decimalLongitude, occ_data$decimalLatitude, col="red", cex = 0.1)
+spatial_mesh3$n
+```
+
+setting the priors for the spatial effect
+```{r}
+spde <- inla.spde2.matern(mesh = spatial_mesh3, alpha = 2)
+```
+
+
+```{r}
+A <- inla.spde.make.A(spatial_mesh3, loc = coords)
+dim(A)
+
+row_counts <- rowSums(A != 0); head(row_counts)
+row_sums <- rowSums(A); head(row_sums)
+# apply(A, 1, function(x) x[x > 0]) %>% t %>% head
+```
+
+
+```{r}
+specs <- poa_traits$species
+
+#Loop over species and compute one A-row per species
+spec_A_list <- lapply(specs, function(x) {
+  rows_x <- which(poa_traits_occ$species == x)
+  A_x <- A[rows_x, , drop = FALSE]
+  A_x_mean <- apply(A_x, 2, mean)
+
+  return(A_x_mean)
+})
+
+spec_A_rows <- do.call(rbind, spec_A_list)
+
+
+## convert back to sparse matrix
+spec_A_rows <- Matrix(spec_A_rows, sparse = TRUE) 
+
+dim(spec_A_rows)
+apply(spec_A_rows, 1, sum) %>% head
+
+apply(spec_A_rows, 1, function(x) sum(x > 0)) 
+
+```
+
+
+
+
+```{r}
+stack <- inla.stack(data = list(resp = poa_traits$log_maxss.range.size.sqkm_st),
+                    A = list(spec_A_rows, 1, 1, 1), 
+                    effects=list(spat_id = 1:spde$n.spde,
+                                 phy_id = poa_traits$phy_id,
+                                 intercept = rep(1, nrow(poa_traits)), 
+                                 list(Endophyte = poa_traits$Endophyte_status
+                                      )), tag='est') 
+```
+
+
+```{r}
+## estimate spatial random effect for each species
+stck.loc <- inla.stack(data = list(resp = NA),
+                       A = list(spec_A_rows),
+                       effects = list(spat_id = 1:spde$n.spde), tag='loc') 
+
+## estimate phylogenetic random effect for each species
+stck.phy <- inla.stack(data = list(resp = NA), A = list(1),
+                       effects=list(phy_id = poa_traits$phy_id), tag='phy') 
+
+big_stack <- inla.stack(stack, stck.loc, stck.phy)
+```
+
+
+
+```{r}
+full_mod <- inla(resp ~ 0 + intercept + Endophyte +
+                   f(spat_id, model = spde) + ## spatial random effect
+                   f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                 family = "gaussian",
+                 data = inla.stack.data(big_stack, spde = spde),
+                 control.predictor = list(A = inla.stack.A(big_stack), compute = TRUE,
+                                          link = 1), 
+                 control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                 num.threads = 10 
+)
+
+summary(full_mod)
+```
+
+
+```{r}
+grid <- inla.mesh.projector(spatial_mesh3, dims = c(501,501))
+
+
+prd_mean <- inla.mesh.project(grid, full_mod$summary.ran$spat_id$mean) 
+prd_sd <- inla.mesh.project(grid, full_mod$summary.ran$spat_id$sd)
+
+grid_df <- tibble(long = grid$lattice$loc[ , 1], 
+                  lat = grid$lattice$loc[ , 2],
+                  prediction_mean = as.vector(prd_mean), 
+                  prediction_sd = as.vector(prd_sd))
+```
+
+
+```{r}
+bbox <- st_bbox(coast, crs = "+proj=longlat +datum=WGS84 +no_defs")
+
+# Convert to sf polygon
+grid_sf <- st_as_sf(grid_df, coords = c("long", "lat"), crs = 4326)
+
+land <- st_union(coast)
+
+grid_crop <- grid_sf[st_intersects(grid_sf, land, sparse = FALSE), ]
+
+grid_crop <- grid_crop %>%
+  mutate(long = st_coordinates(grid_crop)[,1],
+         lat  = st_coordinates(grid_crop)[,2])
+
+spat_map <- ggplot(coast) +
+  geom_sf() +
+  geom_raster(data = grid_crop, aes(x = long, y = lat, fill = prediction_mean)) + 
+  # geom_sf(data = sea, fill = "white") +
+  scale_fill_viridis(name = "Spatial effect", na.value = NA) + 
+  theme_map() 
+
+spat_map
+```
+
+
+
+
+
+
+
+
+
+now to try some different spatial priors, using spatial mesh 1 because this was the best one
+
+Mesh1
+```{r}
+coords <- st_as_sf(occ_data, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+
+boundary <- list(inla.nonconvex.hull(coords, 5, resolution=c(60,60), crs=4326),
+                 inla.nonconvex.hull(coords, 12, resolution=c(50,50), crs=4326 ))
+
+```
+
+```{r}
+## Build the mesh:
+spatial_mesh1 <- inla.mesh.2d(boundary=boundary, 
+                             max.edge=c(5, 12),
+                             # min.angle=30,
+                             cutoff= 3, ## Filter away adjacent points. 
+                             offset=c(1, 2))
+
+
+
+plot(spatial_mesh1)
+plot(spatial_mesh1); points(occ_data$decimalLongitude, occ_data$decimalLatitude, col="red", cex = 0.1)
+spatial_mesh1$n
+```
+
+
+```{r}
+A <- inla.spde.make.A(spatial_mesh1, loc = coords)
+dim(A)
+
+row_counts <- rowSums(A != 0); head(row_counts)
+row_sums <- rowSums(A); head(row_sums)
+apply(A, 1, function(x) x[x > 0]) %>% t %>% head
+```
+
+
+```{r}
+specs <- poa_traits$species
+
+# Loop over species and compute one A-row per species
+spec_A_list <- lapply(specs, function(x) {
+  rows_x <- which(poa_traits_occ$species == x)
+  A_x <- A[rows_x, , drop = FALSE]
+  A_x_mean <- apply(A_x, 2, mean)
+
+  return(A_x_mean)
+})
+
+
+# Combine species rows into a single matrix
+spec_A_rows <- do.call(rbind, spec_A_list)
+
+## convert back to sparse matrix
+spec_A_rows <- Matrix(spec_A_rows, sparse = TRUE) 
+
+dim(spec_A_rows)
+apply(spec_A_rows, 1, sum) %>% head
+
+apply(spec_A_rows, 1, function(x) sum(x > 0)) 
+
+```
+
+
+
+```{r}
+spde <- inla.spde2.pcmatern(
+  mesh = spatial_mesh1, alpha = 2, 
+  prior.range = c(2, 0.1), 
+  prior.sigma = c(1, 0.1),
+  constr = TRUE)
+```
+
+
+```{r}
+stack <- inla.stack(data = list(resp = poa_traits$log_maxss.range.size.sqkm_st),
+                    A = list(spec_A_rows, 1, 1, 1), 
+                    effects=list(spat_id = 1:spde$n.spde,
+                                 phy_id = poa_traits$phy_id,
+                                 intercept = rep(1, nrow(poa_traits)), 
+                                 list(Endophyte = poa_traits$Endophyte_status
+                                      )), tag='est') 
+```
+
+
+```{r}
+## estimate spatial random effect for each species
+stck.loc <- inla.stack(data = list(resp = NA),
+                       A = list(spec_A_rows),
+                       effects = list(spat_id = 1:spde$n.spde), tag='loc') 
+
+## estimate phylogenetic random effect for each species
+stck.phy <- inla.stack(data = list(resp = NA), A = list(1),
+                       effects=list(phy_id = poa_traits$phy_id), tag='phy') 
+
+big_stack <- inla.stack(stack, stck.loc, stck.phy)
+```
+
+
+
+```{r}
+full_mod <- inla(resp ~ 0 + intercept + Endophyte +
+                   f(spat_id, model = spde) + ## spatial random effect
+                   f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                 family = "gaussian",
+                 data = inla.stack.data(big_stack, spde = spde),
+                 control.predictor = list(A = inla.stack.A(big_stack), compute = TRUE,
+                                          link = 1), 
+                 control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                 num.threads = 10 
+)
+
+summary(full_mod)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+spde <- inla.spde2.pcmatern(
+  mesh = spatial_mesh1, alpha = 2,
+  prior.range = c(50, 0.5),   # median practical range ~50 units
+  prior.sigma = c(2, 0.5),
+  constr = TRUE)
+```
+
+
+```{r}
+stack <- inla.stack(data = list(resp = poa_traits$log_maxss.range.size.sqkm_st),
+                    A = list(spec_A_rows, 1, 1, 1), 
+                    effects=list(spat_id = 1:spde$n.spde,
+                                 phy_id = poa_traits$phy_id,
+                                 intercept = rep(1, nrow(poa_traits)), 
+                                 list(Endophyte = poa_traits$Endophyte_status
+                                      )), tag='est') 
+```
+
+
+```{r}
+## estimate spatial random effect for each species
+stck.loc <- inla.stack(data = list(resp = NA),
+                       A = list(spec_A_rows),
+                       effects = list(spat_id = 1:spde$n.spde), tag='loc') 
+
+## estimate phylogenetic random effect for each species
+stck.phy <- inla.stack(data = list(resp = NA), A = list(1),
+                       effects=list(phy_id = poa_traits$phy_id), tag='phy') 
+
+big_stack <- inla.stack(stack, stck.loc, stck.phy)
+```
+
+
+
+```{r}
+full_mod <- inla(resp ~ 0 + intercept + Endophyte +
+                   f(spat_id, model = spde) + ## spatial random effect
+                   f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                 family = "gaussian",
+                 data = inla.stack.data(big_stack, spde = spde),
+                 control.predictor = list(A = inla.stack.A(big_stack), compute = TRUE,
+                                          link = 1), 
+                 control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                 num.threads = 10 
+)
+
+summary(full_mod)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+spde <- inla.spde2.pcmatern(
+  mesh = spatial_mesh1, alpha = 2, ### mesh and smoothness parameter
+  prior.range = c(20, 0.1), ### P(practic.range<2)=0.1
+  prior.sigma = c(1, 0.1),
+  constr = TRUE)
+```
+
+
+```{r}
+stack <- inla.stack(data = list(resp = poa_traits$log_maxss.range.size.sqkm_st),
+                    A = list(spec_A_rows, 1, 1, 1), 
+                    effects=list(spat_id = 1:spde$n.spde,
+                                 phy_id = poa_traits$phy_id,
+                                 intercept = rep(1, nrow(poa_traits)), 
+                                 list(Endophyte = poa_traits$Endophyte_status
+                                      )), tag='est') 
+```
+
+
+```{r}
+## estimate spatial random effect for each species
+stck.loc <- inla.stack(data = list(resp = NA),
+                       A = list(spec_A_rows),
+                       effects = list(spat_id = 1:spde$n.spde), tag='loc') 
+
+## estimate phylogenetic random effect for each species
+stck.phy <- inla.stack(data = list(resp = NA), A = list(1),
+                       effects=list(phy_id = poa_traits$phy_id), tag='phy') 
+
+big_stack <- inla.stack(stack, stck.loc, stck.phy)
+```
+
+
+```{r}
+full_mod <- inla(resp ~ 0 + intercept + Endophyte +
+                   f(spat_id, model = spde) + ## spatial random effect
+                   f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                 family = "gaussian",
+                 data = inla.stack.data(big_stack, spde = spde),
+                 control.predictor = list(A = inla.stack.A(big_stack), compute = TRUE,
+                                          link = 1), 
+                 control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                 num.threads = 10 
+)
+
+summary(full_mod)
+```
+
+
+
+
+
+
+
+```{r}
+spde <- inla.spde2.pcmatern(
+  mesh = spatial_mesh1, alpha = 2,
+  prior.range = c(5, 0.5),   
+  prior.sigma = c(0.3, 0.5),
+  constr = TRUE)
+```
+
+
+```{r}
+stack <- inla.stack(data = list(resp = poa_traits$log_maxss.range.size.sqkm_st),
+                    A = list(spec_A_rows, 1, 1, 1), 
+                    effects=list(spat_id = 1:spde$n.spde,
+                                 phy_id = poa_traits$phy_id,
+                                 intercept = rep(1, nrow(poa_traits)), 
+                                 list(Endophyte = poa_traits$Endophyte_status
+                                      )), tag='est') 
+```
+
+
+```{r}
+## estimate spatial random effect for each species
+stck.loc <- inla.stack(data = list(resp = NA),
+                       A = list(spec_A_rows),
+                       effects = list(spat_id = 1:spde$n.spde), tag='loc') 
+
+## estimate phylogenetic random effect for each species
+stck.phy <- inla.stack(data = list(resp = NA), A = list(1),
+                       effects=list(phy_id = poa_traits$phy_id), tag='phy') 
+
+big_stack <- inla.stack(stack, stck.loc, stck.phy)
+```
+
+
+```{r}
+full_mod <- inla(resp ~ 0 + intercept + Endophyte +
+                   f(spat_id, model = spde) + ## spatial random effect
+                   f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                 family = "gaussian",
+                 data = inla.stack.data(big_stack, spde = spde),
+                 control.predictor = list(A = inla.stack.A(big_stack), compute = TRUE,
+                                          link = 1), 
+                 control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                 num.threads = 10 
+)
+
+summary(full_mod)
+```
+
+
+
+
+
+
+```{r}
+spde <- inla.spde2.pcmatern(
+  mesh = spatial_mesh1, alpha = 2,
+  prior.range = c(3, 0.5),   # P(range < 5) = 0.5  (centred around posterior)
+  prior.sigma = c(0.3, 0.5),
+  constr = TRUE
+)
+```
+
+
+```{r}
+stack <- inla.stack(data = list(resp = poa_traits$log_maxss.range.size.sqkm_st),
+                    A = list(spec_A_rows, 1, 1, 1), 
+                    effects=list(spat_id = 1:spde$n.spde,
+                                 phy_id = poa_traits$phy_id,
+                                 intercept = rep(1, nrow(poa_traits)), 
+                                 list(Endophyte = poa_traits$Endophyte_status
+                                      )), tag='est') 
+```
+
+
+```{r}
+## estimate spatial random effect for each species
+stck.loc <- inla.stack(data = list(resp = NA),
+                       A = list(spec_A_rows),
+                       effects = list(spat_id = 1:spde$n.spde), tag='loc') 
+
+## estimate phylogenetic random effect for each species
+stck.phy <- inla.stack(data = list(resp = NA), A = list(1),
+                       effects=list(phy_id = poa_traits$phy_id), tag='phy') 
+
+big_stack <- inla.stack(stack, stck.loc, stck.phy)
+```
+
+
+```{r}
+full_mod <- inla(resp ~ 0 + intercept + Endophyte +
+                   f(spat_id, model = spde) + ## spatial random effect
+                   f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                 family = "gaussian",
+                 data = inla.stack.data(big_stack, spde = spde),
+                 control.predictor = list(A = inla.stack.A(big_stack), compute = TRUE,
+                                          link = 1), 
+                 control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                 num.threads = 10 
+)
+
+summary(full_mod)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+spde <- inla.spde2.pcmatern(
+  mesh = spatial_mesh1, alpha = 2,
+  prior.range = c(30, 0.5),
+  prior.sigma = c(1.5, 0.5),
+  constr = TRUE
+)
+```
+
+
+```{r}
+stack <- inla.stack(data = list(resp = poa_traits$log_maxss.range.size.sqkm_st),
+                    A = list(spec_A_rows, 1, 1, 1), 
+                    effects=list(spat_id = 1:spde$n.spde,
+                                 phy_id = poa_traits$phy_id,
+                                 intercept = rep(1, nrow(poa_traits)), 
+                                 list(Endophyte = poa_traits$Endophyte_status
+                                      )), tag='est') 
+```
+
+
+```{r}
+## estimate spatial random effect for each species
+stck.loc <- inla.stack(data = list(resp = NA),
+                       A = list(spec_A_rows),
+                       effects = list(spat_id = 1:spde$n.spde), tag='loc') 
+
+## estimate phylogenetic random effect for each species
+stck.phy <- inla.stack(data = list(resp = NA), A = list(1),
+                       effects=list(phy_id = poa_traits$phy_id), tag='phy') 
+
+big_stack <- inla.stack(stack, stck.loc, stck.phy)
+```
+
+
+```{r}
+full_mod <- inla(resp ~ 0 + intercept + Endophyte +
+                   f(spat_id, model = spde) + ## spatial random effect
+                   f(phy_id, model = "generic0", Cmatrix = phylo_prec_mat, constr = TRUE, hyper = pcprior),
+                 family = "gaussian",
+                 data = inla.stack.data(big_stack, spde = spde),
+                 control.predictor = list(A = inla.stack.A(big_stack), compute = TRUE,
+                                          link = 1), 
+                 control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                 num.threads = 10 
+)
+
+summary(full_mod)
+```
+
+
+
+
+
+
+

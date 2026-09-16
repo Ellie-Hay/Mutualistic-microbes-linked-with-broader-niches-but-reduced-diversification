@@ -1,0 +1,213 @@
+#######################################################################################
+# RevBayes Analysis: Hidden State SSE for effect of endophytes on Poa diversification #
+# Original Author: Rosana Zenil-Ferguson                                              #
+# Edited by Eleanor Hay                                                               #
+#######################################################################################
+
+#######################
+# Reading in the Data #
+#######################
+NUM_STATES = 2
+NUM_HIDDEN = 2
+NUM_RATES = NUM_STATES * NUM_HIDDEN
+DATASET   = "DATASET"
+
+
+# Read in the observed phylogeny
+observed_phylogeny <- readTrees("treefile.nex")[1]
+data <- readCharacterData("discretechracterdata.nex") #endophyte status, 0 = non known associations with Epichloe, 1 = known associations with Epichloe
+
+
+# we need to expand the data to the hidden states
+data_exp <- data.expandCharacters( NUM_HIDDEN )
+
+# Get some useful variables from the data. We need these later on.
+taxa <- observed_phylogeny.taxa()
+
+moves = VectorMoves()
+monitors = VectorMonitors()
+
+#########################################################
+# Set up the transition rate matrix for observed states #
+#########################################################
+## Very loosely defining gamma priors for rates in the Q-mat
+shape_pr := 0.5
+############### Alternative definition or rate parameter
+# Each transition rate between observed states are drawn
+# from an exponential distribution with a mean of 10
+# character state transitions over the tree.
+rate_pr := observed_phylogeny.treeLength()/5
+
+q_01A ~ dnGamma(shape=shape_pr, rate=rate_pr)
+q_10A ~ dnGamma(shape=shape_pr, rate=rate_pr)
+q_01B ~ dnGamma(shape=shape_pr, rate=rate_pr)
+q_10B ~ dnGamma(shape=shape_pr, rate=rate_pr)
+
+q_AB0 ~ dnGamma(shape=shape_pr, rate=rate_pr) # Hidden rate first layer between 0
+q_BA0 ~ dnGamma(shape=shape_pr, rate=rate_pr) # Hidden rate first layer between 0
+q_AB1 ~ dnGamma(shape=shape_pr, rate=rate_pr) # Hidden rate first layer between 1
+q_BA1 ~ dnGamma(shape=shape_pr, rate=rate_pr) # Hidden rate first layer between 1
+
+### Moves transitions between hidden states
+moves.append(mvScale(q_01A, weight=2 ))
+moves.append(mvScale(q_10A, weight=2 ))
+moves.append(mvScale(q_01B, weight=2 ))
+moves.append(mvScale(q_10B, weight=2 ))
+
+moves.append(mvScale( q_AB0, weight=2 ))
+moves.append(mvScale( q_BA0, weight=2 ))
+moves.append(mvScale( q_AB1, weight=2 ))
+moves.append(mvScale( q_BA1, weight=2 ))
+
+
+# first initialize the matrix with all zeros:
+for (i in 1:NUM_RATES) {
+for (j in 1:NUM_RATES) {
+q[i][j] := 0.0
+}
+}
+
+q[1][2]:= q_01A
+q[1][3]:= q_AB0
+q[2][1]:= q_10A
+q[2][4]:= q_AB1
+q[3][4]:= q_01B
+q[3][1]:= q_BA0
+q[4][3]:= q_10B
+q[4][2]:= q_BA1
+
+# generate the actual matrix
+rate_matrix:= fnFreeK(q, rescaled=false, matrixExponentialMethod="scalingAndSquaring")
+
+
+####################
+# Create the rates #
+####################
+
+### Specify a prior on the diversification and turnover rate
+
+### Create the constant prior parameters of the diversification rates
+## Number of surviving lineages is
+total_taxa<- observed_phylogeny.ntips()
+H = 0.5
+rate_mean <- ln(ln(total_taxa/2.0) / observed_phylogeny.rootAge())
+rate_sd <- 2*H
+
+for (i in 1:NUM_STATES) {
+### Create a lognormal distributed variable for the diversification rate
+speciation_alpha[i] ~ dnNormal(mean=rate_mean,sd=rate_sd)
+moves.append(mvSlide(speciation_alpha[i],delta=0.20,tune=true,weight=2.0))
+moves.append(mvScale(speciation_alpha[i],lambda=0.20,tune=true,weight=2.0))
+
+### Create a lognormal distributed variable for the turnover rate
+extinction_alpha[i] ~ dnNormal(mean=rate_mean,sd=rate_sd)
+moves.append(mvSlide(extinction_alpha[i],delta=0.20,tune=true,weight=2.0))
+moves.append(mvScale(extinction_alpha[i],lambda=0.20,tune=true,weight=2.0))
+}
+
+
+for (i in 1:(NUM_HIDDEN-1)) {
+
+### Create an exponential distributed variable for the speciation rate
+speciation_beta[i] ~ dnNormal(0.0,1.0)
+moves.append(mvScale(speciation_beta[i],lambda=0.20,tune=true,weight=2.0))
+moves.append(mvSlide(speciation_beta[i],delta=0.20,tune=true,weight=2.0))
+
+### Create an normal distributed variable for the extinction
+extinction_beta[i] ~ dnNormal(0.0,1.0)
+moves.append(mvScale(extinction_beta[i],lambda=0.20,tune=true,weight=2.0))
+moves.append(mvSlide(extinction_beta[i],delta=0.20,tune=true,weight=2.0))
+
+}
+
+for (j in 1:NUM_HIDDEN) {
+for (i in 1:NUM_STATES) {
+if ( j == 1) {
+speciation[i] := exp( speciation_alpha[i] )
+extinction[i] := exp( extinction_alpha[i] )
+} else {
+index = i+(j*NUM_STATES)-NUM_STATES
+speciation[index] := exp( speciation_alpha[i] + speciation_beta[j-1] )
+extinction[index] := exp( extinction_alpha[i] + extinction_beta[j-1] )
+}
+}
+}
+
+net_diversification := speciation-extinction
+#turnover := extinction / speciation
+
+
+#####################################
+# Set up the root state frequencies #
+#####################################
+
+### Create a constant variable with the prior probabilities of each rate category at the root.
+root_frequencies~ dnDirichlet( rep(1,NUM_RATES) )
+moves.append(mvDirichletSimplex(root_frequencies,tune=true,weight=2))
+moves.append(mvElementSwapSimplex(root_frequencies, weight=2))
+
+### Create the fix parameter for the age of the root set to the observed age
+root <- observed_phylogeny.rootAge()
+
+### rho is the probability of sampling species at the present
+total_clade = 606 # there are an estimated 606 species of Poa (following the world checklist of vascular plants v13.1)
+rho <- total_taxa/total_clade
+
+#### construct a variable for the tree drawn from a birth death process
+hisse ~ dnCDBDP( rootAge = root,
+speciationRates   = speciation,
+extinctionRates   = extinction,
+Q                 = rate_matrix,
+pi                = root_frequencies,
+rho               = rho,
+delta             = 1.0,
+condition         = "time" )
+
+### clamp the model with the "observed" tree
+hisse.clamp( observed_phylogeny )
+hisse.clampCharData( data_exp )
+
+
+
+#############
+# The Model #
+#############
+
+### workspace model wrapper ###
+mymodel = model(rate_matrix)
+
+### set up the monitors that will output parameter values to file and screen
+
+monitors.append(mnModel(filename="output/"+DATASET+"_hisse.log", printgen=1))
+monitors.append(mnJointConditionalAncestralState(tree=hisse, cdbdp=hisse, type="NaturalNumbers", printgen=1, withTips=true, withStartStates=false, filename="output/"+DATASET+"_anc_states_hisse.log"))
+monitors.append( mnStochasticCharacterMap(cdbdp=hisse,printgen=1,filename="output/"+DATASET+"_stochmap_hisse.log", include_simmap=true))
+monitors.append(mnScreen(printgen=10, speciation, extinction, net_diversification))
+
+
+################
+# The Analysis #
+################
+
+### workspace mcmc
+mymcmc = mcmc(mymodel, monitors, moves, nruns=2, moveschedule="random")
+
+### pre-burnin to tune the proposals
+mymcmc.burnin(generations=5000,tuningInterval=100)
+
+### run the MCMC
+mymcmc.run(generations=100000)
+
+
+##############################
+# Summarize ancestral states #
+##############################
+
+anc_states = readAncestralStateTrace("output/"+DATASET+"_anc_states_hisse_run_1.log")
+
+anc_tree = ancestralStateTree(tree=observed_phylogeny, ancestral_state_trace_vector=anc_states, include_start_states=false, file="output/"+DATASET+"_anc_states_summary_hisse_run_1.tree", burnin=5000, summary_statistic="MAP", reconstruction="marginal")
+
+anc_state_trace = readAncestralStateTrace("output/"+DATASET+"_stochmap_hisse_run_1.log")
+
+characterMapTree(observed_phylogeny, anc_state_trace, character_file="output/"+DATASET+"_stochmap_hisse_run_1.tree", posterior_file="output/"+DATASET+"_posterior_hisse_run_1.tree", burnin=50, reconstruction="marginal")
+
+q()
